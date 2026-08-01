@@ -1,3 +1,73 @@
-[tool.poetry]
-name = "google-photos-downloader"
-version = "
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-photos-liked-downloader"
+version = "0.1.0"
+description = "A resumable Playwright-based utility for downloading liked photos from a shared Google Photos album."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Sai Teja Chittaluri" }
+]
+keywords = ["google-photos", "playwright", "downloader", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP :: Browsers",
+  "Topic :: Utilities"
+]
+dependencies = [
+  "playwright==1.62.0",
+  "click>=8.1,<9",
+  "loguru>=0.7,<1",
+  "pydantic>=2.7,<3",
+  "SQLAlchemy>=2.0,<3",
+  "databases[aiosqlite]>=0.9,<1",
+  "aiosqlite>=0.20,<1",
+  "alembic>=1.13,<2",
+  "tqdm>=4.66,<5"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.23,<1",
+  "pytest-cov>=5,<7",
+  "ruff>=0.6,<1",
+  "mypy>=1.11,<2"
+]
+
+[project.scripts]
+google-photos-liked-downloader = "entrypoints.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["domain*", "entrypoints*", "infrastructure*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+no_implicit_optional = true

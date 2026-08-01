@@ -1,157 +1,223 @@
-from databases import Database
-from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer, Boolean, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.exc import IntegrityError
-from loguru import logger
-from datetime import datetime
-from infrastructure.exceptions import DatabaseError
+"""Asynchronous SQLite persistence for downloader state and history."""
 
-Base = declarative_base()
-metadata = MetaData()
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from databases import Database
+from loguru import logger
+
+from infrastructure.exceptions import DatabaseError
 
 
 class DatabaseManager:
-    def __init__(self, db_url: str = "sqlite+aiosqlite:///app.db"):
-        """
-        Manages database operations for the application.
+    """Manage the local SQLite database used for resume and deduplication.
 
-        Args:
-            db_url (str): The database connection URL.
-        """
+    The schema is created automatically during :meth:`connect`, so users do not
+    need to install or run SQLite separately or execute migrations for v1.
+    """
+
+    def __init__(self, db_url: str = "sqlite+aiosqlite:///state/downloader.db") -> None:
         self.db_url = db_url
         self.database = Database(db_url)
+        self._connected = False
 
-    async def connect(self):
-        """Connect to the database."""
+    async def connect(self) -> None:
+        """Connect to SQLite and create all required tables and indexes."""
+        if self._connected:
+            return
+
         try:
             await self.database.connect()
-            logger.info("Connected to the database.")
-        except Exception as e:
-            logger.error("Failed to connect to the database: {}", e)
-            raise DatabaseError("Failed to connect to the database.") from e
+            self._connected = True
+            await self.initialize_schema()
+            logger.info("Connected to database and verified schema.")
+        except Exception as exc:
+            if self._connected:
+                await self.database.disconnect()
+                self._connected = False
+            logger.exception("Failed to initialize database.")
+            raise DatabaseError("Failed to connect to or initialize the database.") from exc
 
-    async def disconnect(self):
-        """Disconnect from the database."""
+    async def disconnect(self) -> None:
+        """Close the database connection safely."""
+        if not self._connected:
+            return
+
         try:
             await self.database.disconnect()
-            logger.info("Disconnected from the database.")
-        except Exception as e:
-            logger.error("Failed to disconnect from the database: {}", e)
-            raise DatabaseError("Failed to disconnect from the database.") from e
+        except Exception as exc:
+            logger.exception("Failed to disconnect from database.")
+            raise DatabaseError("Failed to disconnect from the database.") from exc
+        finally:
+            self._connected = False
 
-    async def add_photo(self, photo_id: str, url: str, liked: bool):
-        """
-        Add a photo to the database.
+    async def initialize_schema(self) -> None:
+        """Create the v1 schema idempotently."""
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS photos (
+                photo_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                liked INTEGER NOT NULL CHECK (liked IN (0, 1)),
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS downloads (
+                photo_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                downloaded_at TEXT NOT NULL,
+                FOREIGN KEY (photo_id) REFERENCES photos(photo_id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_photos_liked ON photos(liked)",
+            "CREATE INDEX IF NOT EXISTS idx_downloads_downloaded_at ON downloads(downloaded_at)",
+        )
 
-        Args:
-            photo_id (str): The unique ID of the photo.
-            url (str): The URL of the photo.
-            liked (bool): Whether the photo is liked.
-
-        Raises:
-            DatabaseError: If the photo cannot be added.
-        """
-        query = """
-        INSERT INTO photos (photo_id, url, liked)
-        VALUES (:photo_id, :url, :liked)
-        """
         try:
-            await self.database.execute(query, {"photo_id": photo_id, "url": url, "liked": liked})
-            logger.info("Photo added to the database: {}", photo_id)
-        except IntegrityError:
-            logger.warning("Photo already exists in the database: {}", photo_id)
-        except Exception as e:
-            logger.error("Failed to add photo to the database: {}", e)
-            raise DatabaseError("Failed to add photo to the database.") from e
+            await self.database.execute("PRAGMA foreign_keys = ON")
+            for statement in statements:
+                await self.database.execute(statement)
+        except Exception as exc:
+            logger.exception("Failed to create database schema.")
+            raise DatabaseError("Failed to create the database schema.") from exc
 
-    async def add_download(self, photo_id: str, filename: str):
-        """
-        Track a downloaded photo in the database.
-
-        Args:
-            photo_id (str): The unique ID of the photo.
-            filename (str): The filename of the downloaded photo.
-
-        Raises:
-            DatabaseError: If the download cannot be tracked.
-        """
+    async def add_photo(self, photo_id: str, url: str, liked: bool) -> None:
+        """Insert or refresh a photo observation without losing history."""
+        now = _utc_now()
         query = """
-        INSERT INTO downloads (photo_id, filename, timestamp)
-        VALUES (:photo_id, :filename, :timestamp)
+            INSERT INTO photos (photo_id, url, liked, first_seen_at, last_seen_at)
+            VALUES (:photo_id, :url, :liked, :now, :now)
+            ON CONFLICT(photo_id) DO UPDATE SET
+                url = excluded.url,
+                liked = excluded.liked,
+                last_seen_at = excluded.last_seen_at
         """
         try:
             await self.database.execute(
                 query,
-                {"photo_id": photo_id, "filename": filename, "timestamp": datetime.utcnow()},
+                {
+                    "photo_id": photo_id,
+                    "url": url,
+                    "liked": 1 if liked else 0,
+                    "now": now,
+                },
             )
-            logger.info("Download tracked in the database: {}", filename)
-        except Exception as e:
-            logger.error("Failed to track download in the database: {}", e)
-            raise DatabaseError("Failed to track download in the database.") from e
+        except Exception as exc:
+            logger.exception("Failed to save photo {}.", photo_id)
+            raise DatabaseError(f"Failed to save photo '{photo_id}'.") from exc
 
-    async def get_setting(self, key: str) -> str:
-        """
-        Retrieve a setting value from the database.
-
-        Args:
-            key (str): The key of the setting.
-
-        Returns:
-            str: The value of the setting.
-
-        Raises:
-            DatabaseError: If the setting cannot be retrieved.
-        """
-        query = "SELECT value FROM settings WHERE key = :key"
-        try:
-            row = await self.database.fetch_one(query, {"key": key})
-            return row["value"] if row else None
-        except Exception as e:
-            logger.error("Failed to retrieve setting from the database: {}", e)
-            raise DatabaseError("Failed to retrieve setting from the database.") from e
-
-    async def set_setting(self, key: str, value: str):
-        """
-        Set or update a setting value in the database.
-
-        Args:
-            key (str): The key of the setting.
-            value (str): The value of the setting.
-
-        Raises:
-            DatabaseError: If the setting cannot be updated.
-        """
+    async def add_download(self, photo_id: str, filename: str) -> None:
+        """Record a completed download idempotently."""
         query = """
-        INSERT INTO settings (key, value)
-        VALUES (:key, :value)
-        ON CONFLICT(key) DO UPDATE SET value = :value
+            INSERT INTO downloads (photo_id, filename, downloaded_at)
+            VALUES (:photo_id, :filename, :downloaded_at)
+            ON CONFLICT(photo_id) DO UPDATE SET
+                filename = excluded.filename,
+                downloaded_at = excluded.downloaded_at
         """
         try:
-            await self.database.execute(query, {"key": key, "value": value})
-            logger.info("Setting updated in the database: {} = {}", key, value)
-        except Exception as e:
-            logger.error("Failed to update setting in the database: {}", e)
-            raise DatabaseError("Failed to update setting in the database.") from e
+            await self.database.execute(
+                query,
+                {
+                    "photo_id": photo_id,
+                    "filename": filename,
+                    "downloaded_at": _utc_now(),
+                },
+            )
+        except Exception as exc:
+            logger.exception("Failed to record download for {}.", photo_id)
+            raise DatabaseError(f"Failed to record download for '{photo_id}'.") from exc
 
-    async def get_statistics(self) -> dict:
-        """
-        Generate statistics about photos and downloads.
+    async def is_photo_downloaded(self, photo_id: str) -> bool:
+        """Return whether a completed download is already recorded."""
+        try:
+            value = await self.database.fetch_val(
+                "SELECT 1 FROM downloads WHERE photo_id = :photo_id LIMIT 1",
+                {"photo_id": photo_id},
+            )
+            return value is not None
+        except Exception as exc:
+            logger.exception("Failed to check download status for {}.", photo_id)
+            raise DatabaseError(f"Failed to check download status for '{photo_id}'.") from exc
 
-        Returns:
-            dict: A dictionary containing statistics.
+    async def get_setting(self, key: str) -> str | None:
+        """Read a persisted application setting."""
+        try:
+            row = await self.database.fetch_one(
+                "SELECT value FROM settings WHERE key = :key",
+                {"key": key},
+            )
+            return str(row["value"]) if row is not None else None
+        except Exception as exc:
+            logger.exception("Failed to read setting {}.", key)
+            raise DatabaseError(f"Failed to read setting '{key}'.") from exc
 
-        Raises:
-            DatabaseError: If statistics cannot be retrieved.
+    async def set_setting(self, key: str, value: str) -> None:
+        """Create or replace a persisted application setting."""
+        query = """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (:key, :value, :updated_at)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
         """
         try:
-            total_photos = await self.database.fetch_val("SELECT COUNT(*) FROM photos")
-            liked_photos = await self.database.fetch_val("SELECT COUNT(*) FROM photos WHERE liked = 1")
-            total_downloads = await self.database.fetch_val("SELECT COUNT(*) FROM downloads")
+            await self.database.execute(
+                query,
+                {"key": key, "value": value, "updated_at": _utc_now()},
+            )
+        except Exception as exc:
+            logger.exception("Failed to write setting {}.", key)
+            raise DatabaseError(f"Failed to write setting '{key}'.") from exc
+
+    async def get_statistics(self) -> dict[str, int]:
+        """Return processing and download counts."""
+        try:
+            total_photos = int(
+                await self.database.fetch_val("SELECT COUNT(*) FROM photos") or 0
+            )
+            liked_photos = int(
+                await self.database.fetch_val(
+                    "SELECT COUNT(*) FROM photos WHERE liked = 1"
+                )
+                or 0
+            )
+            total_downloads = int(
+                await self.database.fetch_val("SELECT COUNT(*) FROM downloads") or 0
+            )
             return {
                 "total_photos": total_photos,
                 "liked_photos": liked_photos,
                 "total_downloads": total_downloads,
             }
-        except Exception as e:
-            logger.error("Failed to retrieve statistics from the database: {}", e)
-            raise DatabaseError("Failed to retrieve statistics from the database.") from e
+        except Exception as exc:
+            logger.exception("Failed to read database statistics.")
+            raise DatabaseError("Failed to retrieve database statistics.") from exc
+
+    async def health_check(self) -> dict[str, Any]:
+        """Verify connectivity and expose basic diagnostic information."""
+        try:
+            result = await self.database.fetch_val("SELECT sqlite_version()")
+            return {
+                "connected": self._connected,
+                "sqlite_version": str(result),
+                "database_url": self.db_url,
+            }
+        except Exception as exc:
+            raise DatabaseError("Database health check failed.") from exc
+
+
+def _utc_now() -> str:
+    """Return an ISO-8601 UTC timestamp suitable for SQLite text storage."""
+    return datetime.now(timezone.utc).isoformat()

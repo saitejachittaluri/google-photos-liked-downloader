@@ -18,7 +18,8 @@ class PhotoService:
     """Coordinate browser, navigation, detection, persistence, and downloads.
 
     The service deliberately never clicks a Like/Unlike control. A photo is treated as
-    liked only when its activity panel contains at least one participant-like entry.
+    liked only when its currently visible activity panel contains a visible participant-
+    like entry.
     """
 
     def __init__(
@@ -119,16 +120,20 @@ class PhotoService:
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
 
     async def _is_liked_by_anyone(self, page: Page) -> bool:
-        """Return True when the current photo activity contains a participant like."""
+        """Return True only for a visible like entry in the current activity panel."""
         await self._show_viewer_controls(page)
         photo_url = page.url
 
-        if not await self._activity_panel_is_open(page):
-            opened = await self._open_activity_panel(page)
-            if not opened:
-                raise RuntimeError(
-                    "Could not open the Google Photos activity panel for the current photo."
-                )
+        # Always start from a known state. Hidden/stale activity DOM from the previous
+        # photo must never be interpreted as activity for the current photo.
+        if await self._activity_panel_is_open(page):
+            await self._close_activity_panel(page, photo_url)
+
+        opened = await self._open_activity_panel(page)
+        if not opened:
+            raise RuntimeError(
+                "Could not open the Google Photos activity panel for the current photo."
+            )
 
         try:
             await page.wait_for_timeout(500)
@@ -136,10 +141,9 @@ class PhotoService:
                 "[aria-label^='Liked by ']",
                 "[aria-label*=' liked this photo']",
                 "[aria-label*=' liked a photo']",
-                "text=/^Liked by /i",
             )
             for selector in liked_selectors:
-                if await page.locator(selector).count() > 0:
+                if await self._has_visible_match(page.locator(selector)):
                     logger.info("Current photo liked by at least one participant: True")
                     return True
 
@@ -175,23 +179,31 @@ class PhotoService:
         return False
 
     async def _wait_for_activity_panel(self, page: Page) -> bool:
-        for _ in range(10):
+        for _ in range(15):
             if await self._activity_panel_is_open(page):
                 return True
             await page.wait_for_timeout(150)
         return False
 
     async def _activity_panel_is_open(self, page: Page) -> bool:
-        selectors = (
+        close_controls = (
             "[aria-label='Close activity side pane']",
             "[aria-label='Close activity panel']",
-            "[aria-label^='Liked by ']",
-            "[aria-label*=' liked this photo']",
-            "[aria-label*=' liked a photo']",
         )
-        for selector in selectors:
-            if await page.locator(selector).count() > 0:
+        for selector in close_controls:
+            if await self._has_visible_match(page.locator(selector)):
                 return True
+        return False
+
+    async def _has_visible_match(self, locator: Locator) -> bool:
+        """Ignore hidden and stale Google Photos nodes retained in the DOM."""
+        count = min(await locator.count(), 50)
+        for index in range(count):
+            try:
+                if await locator.nth(index).is_visible():
+                    return True
+            except Exception:
+                continue
         return False
 
     async def _show_viewer_controls(self, page: Page) -> None:
@@ -213,7 +225,7 @@ class PhotoService:
         return None
 
     async def _close_activity_panel(self, page: Page, expected_photo_url: str) -> None:
-        """Close only the activity pane; never press Escape, which exits the viewer."""
+        """Close only the activity pane and verify that it actually closed."""
         close_candidates = (
             page.locator("button[aria-label='Close activity side pane']"),
             page.locator("[role='button'][aria-label='Close activity side pane']"),
@@ -228,28 +240,27 @@ class PhotoService:
             try:
                 await button.click(timeout=3_000)
                 await page.wait_for_timeout(250)
-                if page.url == expected_photo_url:
+                if page.url == expected_photo_url and not await self._activity_panel_is_open(page):
                     return
             except Exception:
                 continue
 
-        # In some layouts the same View activity control toggles the pane. Use a DOM
-        # click on that exact read-only action. Never use Escape because it closes the
-        # entire photo viewer and returns to the album grid.
         activity_controls = page.locator("[aria-label='View activity']")
         count = min(await activity_controls.count(), 20)
         for index in range(count):
             try:
                 await activity_controls.nth(index).evaluate("element => element.click()")
                 await page.wait_for_timeout(250)
-                if page.url == expected_photo_url:
+                if page.url == expected_photo_url and not await self._activity_panel_is_open(page):
                     return
             except Exception:
                 continue
 
-        logger.warning(
-            "Could not confirm that the activity panel closed; leaving it open to preserve the photo viewer."
-        )
+        if await self._activity_panel_is_open(page):
+            raise RuntimeError(
+                "Could not close the activity panel safely; refusing to continue because "
+                "stale like information could be applied to the next photo."
+            )
 
     async def _seek_to_photo(self, target_photo_id: str) -> bool:
         visited: set[str] = set()

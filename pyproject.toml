@@ -1,0 +1,3 @@
+[tool.poetry]
+name = "google-photos-downloader"
+version = "

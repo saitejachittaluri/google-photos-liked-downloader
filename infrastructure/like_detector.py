@@ -1,20 +1,22 @@
-from playwright.sync_api import Page
-from loguru import logger
+"""Deprecated per-photo like detector.
+
+Google Photos does not reliably expose activity controls on an individual photo URL.
+The application now indexes liked photo IDs from the shared album's View activity feed
+before traversal. This module intentionally contains no Like/Unlike/Delete-like selectors.
+"""
+
+from __future__ import annotations
+
+from typing import Any
 
 
 class LikeDetector:
-    def __init__(self, page: Page):
+    """Compatibility shell that prevents unsafe legacy detection from being reused."""
+
+    def __init__(self, page: Any) -> None:
         self.page = page
 
     def is_liked(self) -> bool:
-        """Check if the current photo is liked."""
-        try:
-            logger.info("Checking if the photo is liked.")
-            result = self.page.evaluate(
-                """() => !!document.querySelector('[aria-label="Delete like"]')"""
-            )
-            logger.info("Photo liked status: {}", result)
-            return result
-        except Exception as e:
-            logger.error("Failed to detect like status: {}", e)
-            raise
+        raise RuntimeError(
+            "Per-photo like detection is disabled. Use PhotoService's album activity index."
+        )

@@ -121,6 +121,7 @@ class PhotoService:
     async def _is_liked_by_anyone(self, page: Page) -> bool:
         """Return True when the current photo activity contains a participant like."""
         await self._show_viewer_controls(page)
+        photo_url = page.url
 
         if not await self._activity_panel_is_open(page):
             opened = await self._open_activity_panel(page)
@@ -145,7 +146,7 @@ class PhotoService:
             logger.info("Current photo liked by at least one participant: False")
             return False
         finally:
-            await self._close_activity_panel(page)
+            await self._close_activity_panel(page, photo_url)
 
     async def _open_activity_panel(self, page: Page) -> bool:
         """Open activity using visible controls first, then safe DOM-click fallbacks."""
@@ -162,9 +163,6 @@ class PhotoService:
             except Exception:
                 continue
 
-        # Google Photos sometimes leaves the functional activity button attached but
-        # reports it as hidden because the toolbar is transitioning. Triggering its DOM
-        # click is safe: this selector is exclusively the read-only View activity action.
         for index in range(count):
             candidate = candidates.nth(index)
             try:
@@ -214,28 +212,44 @@ class PhotoService:
                 continue
         return None
 
-    async def _close_activity_panel(self, page: Page) -> None:
+    async def _close_activity_panel(self, page: Page, expected_photo_url: str) -> None:
+        """Close only the activity pane; never press Escape, which exits the viewer."""
         close_candidates = (
             page.locator("button[aria-label='Close activity side pane']"),
             page.locator("[role='button'][aria-label='Close activity side pane']"),
             page.locator("button[aria-label='Close activity panel']"),
+            page.locator("[role='button'][aria-label='Close activity panel']"),
         )
+
         for locator in close_candidates:
             button = await self._first_visible(locator)
-            if button is not None:
-                try:
-                    await button.click(timeout=3_000)
-                    await page.wait_for_timeout(150)
+            if button is None:
+                continue
+            try:
+                await button.click(timeout=3_000)
+                await page.wait_for_timeout(250)
+                if page.url == expected_photo_url:
                     return
-                except Exception:
-                    continue
+            except Exception:
+                continue
 
-        try:
-            if await self._activity_panel_is_open(page):
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(150)
-        except Exception:
-            logger.debug("Unable to close the activity panel cleanly.")
+        # In some layouts the same View activity control toggles the pane. Use a DOM
+        # click on that exact read-only action. Never use Escape because it closes the
+        # entire photo viewer and returns to the album grid.
+        activity_controls = page.locator("[aria-label='View activity']")
+        count = min(await activity_controls.count(), 20)
+        for index in range(count):
+            try:
+                await activity_controls.nth(index).evaluate("element => element.click()")
+                await page.wait_for_timeout(250)
+                if page.url == expected_photo_url:
+                    return
+            except Exception:
+                continue
+
+        logger.warning(
+            "Could not confirm that the activity panel closed; leaving it open to preserve the photo viewer."
+        )
 
     async def _seek_to_photo(self, target_photo_id: str) -> bool:
         visited: set[str] = set()

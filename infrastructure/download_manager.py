@@ -12,7 +12,7 @@ from infrastructure.exceptions import DownloadError
 
 
 class DownloadManager:
-    """Download the currently open Google Photos item without polling temp files."""
+    """Download the currently open Google Photos item."""
 
     def __init__(
         self,
@@ -65,7 +65,7 @@ class DownloadManager:
 
         try:
             async with page.expect_download(timeout=self.download_timeout_ms) as info:
-                await download_control.click(timeout=10_000)
+                await self._activate_download_control(download_control)
             download = await info.value
         except Exception as exc:
             raise DownloadError("Google Photos did not start a browser download.") from exc
@@ -76,7 +76,7 @@ class DownloadManager:
 
         destination = self._unique_destination(download.suggested_filename)
         try:
-            await download.save_as(destination)
+            await download.save_as(str(destination))
         except Exception as exc:
             raise DownloadError(f"Unable to save download to {destination}") from exc
 
@@ -85,54 +85,86 @@ class DownloadManager:
 
         return destination.resolve()
 
-    async def _open_download_action(self) -> Locator:
-        """Open the overflow menu and return the exact Download action."""
-        page = self._require_page()
+    async def _activate_download_control(self, control: Locator) -> None:
+        """Activate the real button/menuitem rather than its child text span."""
+        try:
+            await control.click(timeout=10_000)
+            return
+        except Exception as click_error:
+            logger.debug("Normal download click failed; trying DOM click: {}", click_error)
 
-        # Some viewer variants expose a direct Download button.
+        try:
+            await control.evaluate("element => element.click()")
+        except Exception as exc:
+            raise DownloadError("Unable to activate the Google Photos Download action.") from exc
+
+    async def _open_download_action(self) -> Locator:
+        """Open the overflow menu and return the actual Download button/menuitem."""
+        page = self._require_page()
+        await self._show_viewer_controls(page)
+
         direct_candidates = (
-            page.get_by_role("button", name="Download", exact=True),
             page.locator("button[aria-label='Download']"),
             page.locator("[role='button'][aria-label='Download']"),
+            page.get_by_role("button", name="Download", exact=True),
         )
         direct = await self._first_visible(direct_candidates)
         if direct is not None:
             return direct
 
         more_candidates = (
-            page.get_by_role("button", name="More options", exact=True),
             page.locator("button[aria-label='More options']"),
             page.locator("[role='button'][aria-label='More options']"),
+            page.get_by_role("button", name="More options", exact=True),
         )
         more_options = await self._first_visible(more_candidates)
         if more_options is None:
             raise DownloadError("Could not find the Google Photos 'More options' control.")
 
         await more_options.click(timeout=10_000)
-        await page.locator("[role='menu']:visible").first.wait_for(
-            state="visible", timeout=5_000
-        )
+        menu = page.locator("[role='menu']:visible").first
+        await menu.wait_for(state="visible", timeout=5_000)
 
-        menu_candidates = (
-            page.get_by_role("menuitem", name="Download", exact=True),
-            page.locator("[role='menuitem'][aria-label='Download']"),
-            page.locator("[role='menuitem']").filter(has_text="Download"),
-            page.get_by_text("Download", exact=True),
-        )
-        menu_item = await self._first_visible(menu_candidates)
-        if menu_item is None:
-            await self._dismiss_open_menu()
-            raise DownloadError("The Google Photos menu does not contain a Download action.")
+        # In the current Google Photos UI the actionable element is an LI with an
+        # aria-label such as "Download - Shift+D". Clicking its nested text SPAN is
+        # unreliable because the parent LI intercepts pointer events.
+        menu_items = page.locator("[role='menuitem'][aria-label^='Download']")
+        count = min(await menu_items.count(), 20)
+        for index in range(count):
+            item = menu_items.nth(index)
+            try:
+                label = (await item.get_attribute("aria-label") or "").strip()
+                text = (await item.inner_text()).strip()
+                combined = f"{label} {text}".casefold()
+                if "download all" in combined:
+                    continue
+                if await item.is_visible() and await item.is_enabled():
+                    return item
+            except Exception:
+                continue
 
-        # Avoid accidentally choosing 'Download all'.
-        text = (await menu_item.inner_text()).strip()
-        if text and text.casefold() != "download":
-            exact = page.get_by_text("Download", exact=True)
-            if await exact.count() > 0 and await exact.first.is_visible():
-                return exact.first
-            raise DownloadError(f"Unexpected download menu action: {text}")
+        # Fallback to a menuitem containing exact Download text, but always return
+        # the menuitem parent rather than the nested span.
+        text_matches = page.locator("[role='menuitem']").filter(has_text="Download")
+        count = min(await text_matches.count(), 20)
+        for index in range(count):
+            item = text_matches.nth(index)
+            try:
+                text = (await item.inner_text()).strip().casefold()
+                if text == "download" and await item.is_visible() and await item.is_enabled():
+                    return item
+            except Exception:
+                continue
 
-        return menu_item
+        await self._dismiss_open_menu()
+        raise DownloadError("The Google Photos menu does not contain a usable Download action.")
+
+    async def _show_viewer_controls(self, page: Page) -> None:
+        viewport = page.viewport_size or {"width": 1440, "height": 1000}
+        await page.mouse.move(viewport["width"] // 2, viewport["height"] // 2)
+        await page.wait_for_timeout(100)
+        await page.mouse.move(viewport["width"] // 2, 30)
+        await page.wait_for_timeout(300)
 
     async def _first_visible(self, candidates: tuple[Locator, ...]) -> Locator | None:
         for candidate in candidates:
@@ -151,7 +183,9 @@ class DownloadManager:
         if page is None:
             return
         try:
-            if await page.locator("[role='menu']:visible").count() > 0:
+            menu = page.locator("[role='menu']:visible")
+            if await menu.count() > 0:
+                # Escape closes only the transient overflow menu here, not the activity pane.
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(100)
         except Exception:

@@ -17,12 +17,15 @@ from infrastructure.navigation_engine import NavigationEngine
 
 
 class PhotoService:
-    """Download only photos referenced by the shared album's activity feed.
+    """Download photos liked by at least one participant in a shared album.
 
-    Google Photos exposes "View activity" on the shared-album page, not reliably on an
-    individually opened photo. The service therefore builds a read-only set of liked photo
-    IDs from the album activity feed before opening the first photo. Traversal and download
-    decisions then use only that immutable set.
+    Google Photos exposes participant-like history through the shared album's activity
+    surface. The service indexes that feed from its oldest rendered entries through its
+    newest entries, then traverses the album and downloads only exact matching photo IDs.
+
+    The activity feed can open near its bottom and is virtualized. Therefore, treating an
+    initial ``atEnd`` state as complete misses older likes. This implementation first
+    rewinds repeatedly until the top is stable, then scans forward to the stable bottom.
 
     No Like, Unlike, Delete-like, upload, share, edit, or delete control is selected.
     """
@@ -57,10 +60,10 @@ class PhotoService:
     };
 
     const normalize = (value) => (value || "").replace(/\s+/g, " ").trim();
-    const photoId = (href) => {
-        if (!href) return null;
+    const photoId = (value) => {
+        if (!value) return null;
         try {
-            const url = new URL(href, window.location.href);
+            const url = new URL(value, window.location.href);
             const match = url.pathname.match(/\/(?:photo|p)\/([^/?#]+)/);
             return match ? decodeURIComponent(match[1]) : null;
         } catch (_) {
@@ -68,8 +71,10 @@ class PhotoService:
         }
     };
 
+    const labelled = Array.from(document.querySelectorAll("[aria-label]"));
     const all = Array.from(document.querySelectorAll("*"));
-    const activityHeadings = all.filter((element) => {
+
+    const headings = all.filter((element) => {
         if (!visible(element)) return false;
         const role = element.getAttribute("role");
         const tag = element.tagName.toLowerCase();
@@ -77,58 +82,50 @@ class PhotoService:
         return /^(activity|comments?)$/i.test(normalize(element.textContent));
     });
 
-    const closeControls = Array.from(document.querySelectorAll("[aria-label]")).filter(
-        (element) => {
-            if (!visible(element)) return false;
-            const label = normalize(element.getAttribute("aria-label"));
-            return /^(close|hide).*activity|activity.*(close|hide)$/i.test(label);
-        }
-    );
+    const closeControls = labelled.filter((element) => {
+        if (!visible(element)) return false;
+        const label = normalize(element.getAttribute("aria-label"));
+        return /^(close|hide).*activity|activity.*(close|hide)$/i.test(label);
+    });
 
     const activityRegions = Array.from(document.querySelectorAll(
         "aside,[role='dialog'],[role='complementary'],[role='region']"
     )).filter((element) => {
         if (!visible(element)) return false;
-        const text = normalize(element.textContent).slice(0, 1500);
+        const text = normalize(element.textContent).slice(0, 1800);
         return /\b(activity|liked by|liked (?:a|this|your) photo|comments?)\b/i.test(text);
     });
 
-    const roots = [];
+    const activityOpen = /\/activit(?:y|ies)(?:\/|$)/i.test(window.location.pathname)
+        || headings.length > 0
+        || closeControls.length > 0
+        || activityRegions.length > 0;
+
+    const rootCandidates = [];
     const addRoot = (source) => {
         let node = source;
         for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
             if (!visible(node)) continue;
             const rect = node.getBoundingClientRect();
             if (rect.width >= 240 && rect.height >= 160) {
-                roots.push(node);
+                rootCandidates.push(node);
                 return;
             }
         }
     };
-    activityHeadings.forEach(addRoot);
+    headings.forEach(addRoot);
     closeControls.forEach(addRoot);
-    activityRegions.forEach((element) => roots.push(element));
-
-    const uniqueRoots = Array.from(new Set(roots));
-    const routeLooksLikeActivity = /\/activit(?:y|ies)(?:\/|$)/i.test(
-        window.location.pathname
-    );
-    const activityOpen = routeLooksLikeActivity
-        || uniqueRoots.length > 0
-        || activityHeadings.length > 0
-        || closeControls.length > 0;
-
-    const searchRoots = uniqueRoots.length > 0
-        ? uniqueRoots
-        : (activityOpen ? [document.body] : []);
+    activityRegions.forEach((element) => rootCandidates.push(element));
+    const roots = Array.from(new Set(rootCandidates));
+    const searchRoots = roots.length > 0 ? roots : (activityOpen ? [document.body] : []);
 
     const likeSignals = [];
     for (const root of searchRoots) {
         for (const element of root.querySelectorAll("[aria-label]")) {
             if (!visible(element)) continue;
             const label = normalize(element.getAttribute("aria-label"));
-            if (/^Liked by \S/i.test(label)
-                    || /\bliked (?:a|this|your) photo\b/i.test(label)) {
+            if (/^Liked by\b/i.test(label)
+                    || /\b(?:liked|likes) (?:a|this|your|the) photo(?:s)?\b/i.test(label)) {
                 likeSignals.push(element);
             }
         }
@@ -136,9 +133,10 @@ class PhotoService:
         for (const element of root.querySelectorAll("div,span,p")) {
             if (!visible(element)) continue;
             const text = normalize(element.textContent);
-            if (text.length > 240) continue;
-            if (/\bliked (?:a|this|your) photo(?:s)?\b/i.test(text)
-                    || /\bliked \d+ photo(?:s)?\b/i.test(text)) {
+            if (!text || text.length > 260) continue;
+            if (/\b(?:liked|likes) (?:a|this|your|the) photo(?:s)?\b/i.test(text)
+                    || /\bliked \d+ photo(?:s)?\b/i.test(text)
+                    || /^Liked by\b/i.test(text)) {
                 likeSignals.push(element);
             }
         }
@@ -148,24 +146,39 @@ class PhotoService:
     const unresolved = [];
     const signalLabels = [];
 
+    const idsWithin = (node) => {
+        const values = [];
+        if (node.matches && node.matches("a[href], [data-href], [data-url]")) {
+            values.push(
+                node.getAttribute("href"),
+                node.getAttribute("data-href"),
+                node.getAttribute("data-url")
+            );
+        }
+        for (const item of node.querySelectorAll("a[href], [data-href], [data-url]")) {
+            values.push(
+                item.getAttribute("href"),
+                item.getAttribute("data-href"),
+                item.getAttribute("data-url")
+            );
+        }
+        return Array.from(new Set(values.map(photoId).filter(Boolean)));
+    };
+
     for (const signal of Array.from(new Set(likeSignals))) {
         const descriptor = normalize(
             signal.getAttribute("aria-label") || signal.textContent
         ).slice(0, 220);
         if (descriptor) signalLabels.push(descriptor);
 
-        let node = signal;
         let mapped = [];
+        let node = signal;
         for (let depth = 0; node && depth < 14; depth += 1, node = node.parentElement) {
-            const candidates = [];
-            if (node.matches && node.matches("a[href]")) candidates.push(node);
-            candidates.push(...node.querySelectorAll("a[href]"));
-
-            const nodeIds = Array.from(new Set(
-                candidates.map((anchor) => photoId(anchor.href)).filter(Boolean)
-            ));
-            if (nodeIds.length > 0 && nodeIds.length <= 100) {
-                mapped = nodeIds;
+            const found = idsWithin(node);
+            if (found.length > 0) {
+                // Use the smallest ancestor containing photo links. A large ancestor is
+                // usually the entire feed and would falsely associate unrelated photos.
+                if (found.length <= 20) mapped = found;
                 break;
             }
         }
@@ -177,77 +190,118 @@ class PhotoService:
         }
     }
 
-    const scrollables = [];
-    for (const element of all) {
-        if (!visible(element)) continue;
-        const style = window.getComputedStyle(element);
-        if (!/(auto|scroll)/.test(style.overflowY)) continue;
-        if (element.scrollHeight <= element.clientHeight + 40) continue;
+    const scrollables = all
+        .filter((element) => {
+            if (!visible(element)) return false;
+            const style = window.getComputedStyle(element);
+            return /(auto|scroll)/.test(style.overflowY)
+                && element.scrollHeight > element.clientHeight + 30;
+        })
+        .map((element) => {
+            const rect = element.getBoundingClientRect();
+            const text = normalize(element.textContent).slice(0, 1600);
+            const containsActivity = /\b(activity|liked by|liked (?:a|this|your|the) photo)\b/i.test(text);
+            const containsRoot = roots.some(
+                (root) => element === root || element.contains(root) || root.contains(element)
+            );
+            const score = (containsRoot ? 100000 : 0)
+                + (containsActivity ? 50000 : 0)
+                + (rect.left > window.innerWidth * 0.30 ? 5000 : 0)
+                + Math.max(0, element.scrollHeight - element.clientHeight);
+            return {element, score};
+        })
+        .sort((a, b) => b.score - a.score);
 
-        const text = normalize(element.textContent).slice(0, 1200);
-        const containsActivity = /\b(activity|liked by|liked (?:a|this|your) photo)\b/i.test(text);
-        const containsRoot = uniqueRoots.some(
-            (root) => element === root || element.contains(root) || root.contains(element)
-        );
-        if (!containsActivity && !containsRoot) continue;
-
-        const rect = element.getBoundingClientRect();
-        const score = (containsRoot ? 1000 : 0)
-            + (containsActivity ? 500 : 0)
-            + Math.max(0, element.scrollHeight - element.clientHeight)
-            + (rect.left > window.innerWidth * 0.35 ? 200 : 0);
-        scrollables.push({element, score});
-    }
-
-    scrollables.sort((a, b) => b.score - a.score);
     const scroller = scrollables.length > 0 ? scrollables[0].element : null;
+    const scrollTop = scroller ? scroller.scrollTop : window.scrollY;
+    const scrollHeight = scroller
+        ? scroller.scrollHeight
+        : document.documentElement.scrollHeight;
+    const clientHeight = scroller ? scroller.clientHeight : window.innerHeight;
 
     return {
         open: activityOpen,
         ids: Array.from(ids).sort(),
-        unresolved: Array.from(new Set(unresolved)).slice(0, 20),
-        signals: Array.from(new Set(signalLabels)).slice(0, 20),
-        headingCount: activityHeadings.length,
-        closeCount: closeControls.length,
-        regionCount: activityRegions.length,
-        scrollableCount: scrollables.length,
-        scrollTop: scroller ? scroller.scrollTop : window.scrollY,
-        scrollHeight: scroller ? scroller.scrollHeight : document.documentElement.scrollHeight,
-        clientHeight: scroller ? scroller.clientHeight : window.innerHeight,
-        atEnd: scroller
-            ? scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8
-            : window.scrollY + window.innerHeight
-                >= document.documentElement.scrollHeight - 8,
+        unresolved: Array.from(new Set(unresolved)).slice(0, 50),
+        signals: Array.from(new Set(signalLabels)).slice(0, 30),
+        scrollTop,
+        scrollHeight,
+        clientHeight,
+        atTop: scrollTop <= 8,
+        atEnd: scrollTop + clientHeight >= scrollHeight - 8,
+        scrollerFound: Boolean(scroller),
     };
 }
 """
 
-    _SCROLL_ACTIVITY_SCRIPT = r"""
+    _SCROLL_ACTIVITY_TOP_SCRIPT = r"""
 () => {
     const visible = (element) => {
         if (!(element instanceof Element)) return false;
         const style = window.getComputedStyle(element);
         const rect = element.getBoundingClientRect();
-        return style.display !== "none"
-            && style.visibility !== "hidden"
-            && rect.width > 0
-            && rect.height > 0;
+        return style.display !== "none" && style.visibility !== "hidden"
+            && rect.width > 0 && rect.height > 0;
     };
     const normalize = (value) => (value || "").replace(/\s+/g, " ").trim();
-
     const candidates = Array.from(document.querySelectorAll("*"))
         .filter((element) => {
             if (!visible(element)) return false;
             const style = window.getComputedStyle(element);
-            if (!/(auto|scroll)/.test(style.overflowY)) return false;
-            if (element.scrollHeight <= element.clientHeight + 40) return false;
-            const text = normalize(element.textContent).slice(0, 1200);
-            return /\b(activity|liked by|liked (?:a|this|your) photo)\b/i.test(text);
+            return /(auto|scroll)/.test(style.overflowY)
+                && element.scrollHeight > element.clientHeight + 30;
         })
         .map((element) => {
             const rect = element.getBoundingClientRect();
-            const score = Math.max(0, element.scrollHeight - element.clientHeight)
-                + (rect.left > window.innerWidth * 0.35 ? 500 : 0);
+            const text = normalize(element.textContent).slice(0, 1600);
+            const activity = /\b(activity|liked by|liked (?:a|this|your|the) photo)\b/i.test(text);
+            const score = (activity ? 50000 : 0)
+                + (rect.left > window.innerWidth * 0.30 ? 5000 : 0)
+                + Math.max(0, element.scrollHeight - element.clientHeight);
+            return {element, score};
+        })
+        .sort((a, b) => b.score - a.score);
+
+    if (candidates.length > 0) {
+        const element = candidates[0].element;
+        const before = element.scrollTop;
+        const heightBefore = element.scrollHeight;
+        element.scrollTop = 0;
+        element.dispatchEvent(new Event("scroll", {bubbles: true}));
+        return {target: "element", before, after: element.scrollTop, heightBefore};
+    }
+
+    const before = window.scrollY;
+    const heightBefore = document.documentElement.scrollHeight;
+    window.scrollTo(0, 0);
+    return {target: "window", before, after: window.scrollY, heightBefore};
+}
+"""
+
+    _SCROLL_ACTIVITY_DOWN_SCRIPT = r"""
+() => {
+    const visible = (element) => {
+        if (!(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden"
+            && rect.width > 0 && rect.height > 0;
+    };
+    const normalize = (value) => (value || "").replace(/\s+/g, " ").trim();
+    const candidates = Array.from(document.querySelectorAll("*"))
+        .filter((element) => {
+            if (!visible(element)) return false;
+            const style = window.getComputedStyle(element);
+            return /(auto|scroll)/.test(style.overflowY)
+                && element.scrollHeight > element.clientHeight + 30;
+        })
+        .map((element) => {
+            const rect = element.getBoundingClientRect();
+            const text = normalize(element.textContent).slice(0, 1600);
+            const activity = /\b(activity|liked by|liked (?:a|this|your|the) photo)\b/i.test(text);
+            const score = (activity ? 50000 : 0)
+                + (rect.left > window.innerWidth * 0.30 ? 5000 : 0)
+                + Math.max(0, element.scrollHeight - element.clientHeight);
             return {element, score};
         })
         .sort((a, b) => b.score - a.score);
@@ -257,23 +311,25 @@ class PhotoService:
         const before = element.scrollTop;
         element.scrollTop = Math.min(
             element.scrollHeight,
-            element.scrollTop + Math.max(300, Math.floor(element.clientHeight * 0.82))
+            element.scrollTop + Math.max(280, Math.floor(element.clientHeight * 0.72))
         );
         element.dispatchEvent(new Event("scroll", {bubbles: true}));
         return {
             target: "element",
             before,
             after: element.scrollTop,
+            height: element.scrollHeight,
             atEnd: element.scrollTop + element.clientHeight >= element.scrollHeight - 8,
         };
     }
 
     const before = window.scrollY;
-    window.scrollBy(0, Math.max(400, Math.floor(window.innerHeight * 0.82)));
+    window.scrollBy(0, Math.max(350, Math.floor(window.innerHeight * 0.72)));
     return {
         target: "window",
         before,
         after: window.scrollY,
+        height: document.documentElement.scrollHeight,
         atEnd: window.scrollY + window.innerHeight
             >= document.documentElement.scrollHeight - 8,
     };
@@ -331,8 +387,6 @@ class PhotoService:
             await self.browser_manager.open_url(shared_album_url)
             self._liked_photo_ids = await self._index_liked_photos(page)
 
-            # Reset to the clean album grid. No activity panel state is carried into the
-            # photo viewer, and no second tab is used.
             await page.goto(
                 shared_album_url,
                 wait_until="domcontentloaded",
@@ -387,13 +441,12 @@ class PhotoService:
             )
 
     async def _index_liked_photos(self, page: Page) -> set[str]:
-        """Build the complete liked-photo set from the album-level activity feed."""
+        """Index all photos liked by anyone from the complete album activity history."""
         await page.bring_to_front()
         await page.wait_for_timeout(700)
         await self._show_album_controls(page)
 
-        opened = await self._open_album_activity(page)
-        if not opened:
+        if not await self._open_album_activity(page):
             controls = await self._visible_control_labels(page)
             raise RuntimeError(
                 "The shared album's View activity surface could not be opened. "
@@ -402,33 +455,85 @@ class PhotoService:
 
         liked_ids: set[str] = set()
         unresolved: set[str] = set()
-        previous_signature: tuple[Any, ...] | None = None
-        stable_rounds = 0
 
-        for round_number in range(1, 301):
-            snapshot = await page.evaluate(self._ACTIVITY_SNAPSHOT_SCRIPT)
-            if not snapshot.get("open"):
-                raise RuntimeError(
-                    "The album activity surface closed while likes were being indexed."
-                )
-
+        def absorb(snapshot: dict[str, Any]) -> None:
             liked_ids.update(str(value) for value in snapshot.get("ids", []))
             unresolved.update(str(value) for value in snapshot.get("unresolved", []))
 
+        logger.info("Rewinding album activity to its oldest available entries.")
+        stable_top_rounds = 0
+        previous_top_signature: tuple[Any, ...] | None = None
+
+        for round_number in range(1, 121):
+            before = await page.evaluate(self._ACTIVITY_SNAPSHOT_SCRIPT)
+            if not before.get("open"):
+                raise RuntimeError("The album activity surface closed during rewind.")
+            absorb(before)
+
+            await page.evaluate(self._SCROLL_ACTIVITY_TOP_SCRIPT)
+            await page.wait_for_timeout(600)
+
+            after = await page.evaluate(self._ACTIVITY_SNAPSHOT_SCRIPT)
+            if not after.get("open"):
+                raise RuntimeError("The album activity surface closed during rewind.")
+            absorb(after)
+
             signature = (
+                bool(after.get("atTop")),
+                int(after.get("scrollHeight", 0)),
                 len(liked_ids),
                 len(unresolved),
-                int(snapshot.get("scrollTop", 0)),
-                int(snapshot.get("scrollHeight", 0)),
             )
-            if signature == previous_signature:
-                stable_rounds += 1
+            if bool(after.get("atTop")) and signature == previous_top_signature:
+                stable_top_rounds += 1
             else:
-                stable_rounds = 0
-            previous_signature = signature
+                stable_top_rounds = 0
+            previous_top_signature = signature
 
             logger.debug(
-                "Album activity scan round {}: liked_ids={}, unresolved={}, "
+                "Activity rewind round {}: liked_ids={}, unresolved={}, "
+                "scroll={}/{}, at_top={}.",
+                round_number,
+                len(liked_ids),
+                len(unresolved),
+                after.get("scrollTop", 0),
+                after.get("scrollHeight", 0),
+                after.get("atTop", False),
+            )
+
+            if stable_top_rounds >= 4:
+                break
+        else:
+            raise RuntimeError(
+                "Could not reach a stable top of the album activity feed. "
+                "No downloads were attempted."
+            )
+
+        logger.info("Scanning album activity from oldest to newest entries.")
+        stable_end_rounds = 0
+        previous_end_signature: tuple[Any, ...] | None = None
+
+        for round_number in range(1, 501):
+            snapshot = await page.evaluate(self._ACTIVITY_SNAPSHOT_SCRIPT)
+            if not snapshot.get("open"):
+                raise RuntimeError("The album activity surface closed during forward scan.")
+            absorb(snapshot)
+
+            signature = (
+                bool(snapshot.get("atEnd")),
+                int(snapshot.get("scrollTop", 0)),
+                int(snapshot.get("scrollHeight", 0)),
+                len(liked_ids),
+                len(unresolved),
+            )
+            if bool(snapshot.get("atEnd")) and signature == previous_end_signature:
+                stable_end_rounds += 1
+            else:
+                stable_end_rounds = 0
+            previous_end_signature = signature
+
+            logger.debug(
+                "Activity forward round {}: liked_ids={}, unresolved={}, "
                 "signals={}, scroll={}/{}, at_end={}.",
                 round_number,
                 len(liked_ids),
@@ -439,46 +544,39 @@ class PhotoService:
                 snapshot.get("atEnd", False),
             )
 
-            if snapshot.get("atEnd") and stable_rounds >= 4:
+            if stable_end_rounds >= 4:
                 break
 
-            scroll_result = await page.evaluate(self._SCROLL_ACTIVITY_SCRIPT)
+            await page.evaluate(self._SCROLL_ACTIVITY_DOWN_SCRIPT)
             await page.wait_for_timeout(450)
-
-            if (
-                bool(scroll_result.get("atEnd"))
-                and int(scroll_result.get("after", 0))
-                == int(scroll_result.get("before", 0))
-            ):
-                stable_rounds += 1
         else:
             raise RuntimeError(
-                "Album activity indexing exceeded the safety limit before reaching the end."
+                "Album activity scanning exceeded its safety limit before reaching a "
+                "stable end. No downloads were attempted."
             )
 
         if unresolved:
             samples = sorted(unresolved)[:10]
             raise RuntimeError(
-                "Like activity was found, but some liked entries could not be mapped to "
-                f"photo URLs. No downloads were attempted. Examples: {samples}"
+                "Like activity was detected but could not be mapped safely to every photo. "
+                "No downloads were attempted. Examples: "
+                f"{samples}"
             )
 
-        logger.info(
-            "Indexed {} unique liked photos from the shared album activity feed.",
-            len(liked_ids),
-        )
-        if not liked_ids:
-            logger.warning(
-                "The album activity feed contained no mappable liked-photo entries. "
-                "The run will inspect the album but download nothing."
-            )
-
-        invalid = [value for value in liked_ids if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", value)]
+        invalid = [
+            value
+            for value in liked_ids
+            if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", value)
+        ]
         if invalid:
             raise RuntimeError(
                 f"Activity indexing returned invalid photo identifiers: {invalid[:5]}"
             )
 
+        logger.info(
+            "Indexed {} unique photos liked by at least one album participant.",
+            len(liked_ids),
+        )
         return liked_ids
 
     async def _open_album_activity(self, page: Page) -> bool:
@@ -505,13 +603,12 @@ class PhotoService:
                     state="visible",
                     timeout=4_000,
                 )
-
-                menu_items = (
+                items = (
                     page.locator("[role='menuitem'][aria-label='View activity']"),
                     page.locator("[role='menuitem'][aria-label^='View activity']"),
                     page.get_by_role("menuitem", name="View activity", exact=True),
                 )
-                activity_item = await self._first_visible(menu_items)
+                activity_item = await self._first_visible(items)
                 if activity_item is not None:
                     await activity_item.click(timeout=8_000)
                     if await self._wait_for_activity_surface(page, baseline_url):
@@ -541,11 +638,11 @@ class PhotoService:
 
         if not liked:
             self._summary["not_liked"] += 1
-            logger.info("Photo {} is not present in album like activity; skipping.", photo_id)
+            logger.info("Photo {} has no indexed participant like; skipping.", photo_id)
             return
 
         self._summary["liked"] += 1
-        logger.info("Photo {} is confirmed liked by album activity index.", photo_id)
+        logger.info("Photo {} is confirmed liked by at least one participant.", photo_id)
 
         if await self._is_photo_downloaded(photo_id):
             self._summary["already_downloaded"] += 1

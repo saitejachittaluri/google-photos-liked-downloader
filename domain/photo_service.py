@@ -39,15 +39,9 @@ class PhotoService:
         self.max_photos = max_photos
 
     async def process_photos(self, shared_album_url: str) -> None:
-        """Process the album from its first photo."""
         await self._run(shared_album_url=shared_album_url, resume_after_photo_id=None)
 
-    async def resume_photos(
-        self,
-        shared_album_url: str,
-        last_photo_id: str,
-    ) -> None:
-        """Resume processing immediately after ``last_photo_id``."""
+    async def resume_photos(self, shared_album_url: str, last_photo_id: str) -> None:
         await self._run(
             shared_album_url=shared_album_url,
             resume_after_photo_id=last_photo_id,
@@ -125,65 +119,91 @@ class PhotoService:
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
 
     async def _is_liked_by_anyone(self, page: Page) -> bool:
-        """Return True when the current photo activity contains a participant like.
-
-        The method selects only visible controls. Google Photos commonly keeps hidden
-        duplicate toolbar buttons in the DOM; clicking ``locator.first`` can therefore
-        time out even though a visible button exists elsewhere.
-        """
+        """Return True when the current photo activity contains a participant like."""
         await self._show_viewer_controls(page)
 
-        panel_open = await page.locator(
-            "[aria-label='Close activity side pane']:visible, "
-            "[aria-label='Close activity panel']:visible"
-        ).count() > 0
-
-        if not panel_open:
-            activity_button = await self._first_visible(
-                page.locator("button[aria-label='View activity']")
-            )
-            if activity_button is None:
-                activity_button = await self._first_visible(
-                    page.locator("[role='button'][aria-label='View activity']")
-                )
-            if activity_button is None:
+        if not await self._activity_panel_is_open(page):
+            opened = await self._open_activity_panel(page)
+            if not opened:
                 raise RuntimeError(
-                    "Could not find a visible 'View activity' button for the current photo."
+                    "Could not open the Google Photos activity panel for the current photo."
                 )
-
-            try:
-                await activity_button.click(timeout=5_000)
-                await page.wait_for_timeout(500)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not open the activity panel for the current photo."
-                ) from exc
 
         try:
+            await page.wait_for_timeout(500)
             liked_selectors = (
                 "[aria-label^='Liked by ']",
                 "[aria-label*=' liked this photo']",
                 "[aria-label*=' liked a photo']",
+                "text=/^Liked by /i",
             )
-            liked = False
             for selector in liked_selectors:
                 if await page.locator(selector).count() > 0:
-                    liked = True
-                    break
+                    logger.info("Current photo liked by at least one participant: True")
+                    return True
 
-            logger.info("Current photo liked by at least one participant: {}", liked)
-            return liked
+            logger.info("Current photo liked by at least one participant: False")
+            return False
         finally:
             await self._close_activity_panel(page)
 
+    async def _open_activity_panel(self, page: Page) -> bool:
+        """Open activity using visible controls first, then safe DOM-click fallbacks."""
+        candidates = page.locator("[aria-label='View activity']")
+        count = min(await candidates.count(), 20)
+
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    await candidate.click(timeout=5_000)
+                    if await self._wait_for_activity_panel(page):
+                        return True
+            except Exception:
+                continue
+
+        # Google Photos sometimes leaves the functional activity button attached but
+        # reports it as hidden because the toolbar is transitioning. Triggering its DOM
+        # click is safe: this selector is exclusively the read-only View activity action.
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                await candidate.evaluate("element => element.click()")
+                if await self._wait_for_activity_panel(page):
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    async def _wait_for_activity_panel(self, page: Page) -> bool:
+        for _ in range(10):
+            if await self._activity_panel_is_open(page):
+                return True
+            await page.wait_for_timeout(150)
+        return False
+
+    async def _activity_panel_is_open(self, page: Page) -> bool:
+        selectors = (
+            "[aria-label='Close activity side pane']",
+            "[aria-label='Close activity panel']",
+            "[aria-label^='Liked by ']",
+            "[aria-label*=' liked this photo']",
+            "[aria-label*=' liked a photo']",
+        )
+        for selector in selectors:
+            if await page.locator(selector).count() > 0:
+                return True
+        return False
+
     async def _show_viewer_controls(self, page: Page) -> None:
-        """Reveal auto-hidden Google Photos viewer controls."""
         viewport = page.viewport_size or {"width": 1440, "height": 1000}
-        await page.mouse.move(viewport["width"] // 2, 40)
-        await page.wait_for_timeout(250)
+        await page.mouse.move(viewport["width"] // 2, viewport["height"] // 2)
+        await page.wait_for_timeout(100)
+        await page.mouse.move(viewport["width"] // 2, 30)
+        await page.wait_for_timeout(500)
 
     async def _first_visible(self, locator: Locator) -> Locator | None:
-        """Return the first visible and enabled match from a locator."""
         count = min(await locator.count(), 20)
         for index in range(count):
             candidate = locator.nth(index)
@@ -208,16 +228,16 @@ class PhotoService:
                     await page.wait_for_timeout(150)
                     return
                 except Exception:
-                    break
+                    continue
 
         try:
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(150)
+            if await self._activity_panel_is_open(page):
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(150)
         except Exception:
             logger.debug("Unable to close the activity panel cleanly.")
 
     async def _seek_to_photo(self, target_photo_id: str) -> bool:
-        """Navigate forward until ``target_photo_id`` is reached."""
         visited: set[str] = set()
 
         while True:

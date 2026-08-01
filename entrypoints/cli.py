@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import click
 from loguru import logger
@@ -42,6 +42,7 @@ def validate_config_command(config_path: Path) -> None:
     click.echo(f"Album: {config.shared_album_url}")
     click.echo(f"Download directory: {config.download_dir.resolve()}")
     click.echo(f"Browser profile: {config.chrome_profile_path.resolve()}")
+    click.echo(f"Headless browser: {config.headless}")
 
 
 @cli.command()
@@ -154,16 +155,26 @@ async def _run_download(
 ) -> None:
     config = _load_config(config_path)
     database_manager = DatabaseManager(config.database_url)
-    browser_manager = BrowserManager(config.chrome_profile_path)
+
+    navigation_timeout_ms = config.photo_load_timeout_seconds * 1_000
+    download_timeout_ms = config.download_timeout_seconds * 1_000
+
+    browser_manager = BrowserManager(
+        config.chrome_profile_path,
+        headless=config.headless,
+        navigation_timeout_ms=navigation_timeout_ms,
+    )
 
     # PhotoService injects the active Playwright page after BrowserManager launches.
     navigation_engine = NavigationEngine(
-        None,  # type: ignore[arg-type]
-        retry_delay=max(1, config.navigation_delay_ms // 1000),
+        None,
+        navigation_timeout_ms=navigation_timeout_ms,
+        navigation_delay_ms=config.navigation_delay_ms,
     )
     download_manager = DownloadManager(
-        None,  # type: ignore[arg-type]
-        str(config.download_dir),
+        None,
+        config.download_dir,
+        download_timeout_ms=download_timeout_ms,
     )
     service = PhotoService(
         browser_manager=browser_manager,
@@ -230,12 +241,10 @@ async def _run_diagnostics(config_path: Path) -> None:
     database_manager = DatabaseManager(config.database_url)
     await database_manager.connect()
     try:
-        # The database manager will be enhanced separately to initialize tables.
         await database_manager.get_statistics()
     except Exception as exc:
         raise click.ClickException(
-            "SQLite connection opened, but the application schema is unavailable. "
-            "Database initialization still needs to be completed."
+            "SQLite connection opened, but the application schema is unavailable."
         ) from exc
     finally:
         await database_manager.disconnect()

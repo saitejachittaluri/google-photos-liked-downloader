@@ -17,9 +17,9 @@ from infrastructure.navigation_engine import NavigationEngine
 class PhotoService:
     """Coordinate browser, navigation, detection, persistence, and downloads.
 
-    Safety rule: a photo is downloaded only when a freshly opened activity pane for the
-    current photo contains a visible accessibility label beginning with ``Liked by ``.
-    The service never clicks a Like, Unlike, or Delete-like control.
+    Safety rule: a photo is downloaded only when a freshly reloaded current-photo page
+    exposes a visible accessibility label beginning with ``Liked by `` after the exact
+    read-only ``View activity`` action is invoked. Like/Unlike controls are never used.
     """
 
     def __init__(
@@ -100,8 +100,8 @@ class PhotoService:
             await self.browser_manager.shutdown()
 
     async def _process_current_photo(self, page: Page, photo_id: str) -> None:
-        # Re-evaluate the current UI even when the database says this photo was already
-        # downloaded. Earlier faulty classifications must not bypass the safety check.
+        # Always re-evaluate the live UI. Earlier incorrect database classifications must
+        # never bypass the current safety check.
         liked = await self._is_liked_by_anyone(page, photo_id)
         await self.database_manager.add_photo(photo_id, page.url, liked)
 
@@ -122,12 +122,12 @@ class PhotoService:
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
 
     async def _is_liked_by_anyone(self, page: Page, expected_photo_id: str) -> bool:
-        """Detect likes from an isolated, freshly loaded current-photo activity pane.
+        """Detect likes from a clean page and fail closed on ambiguous state.
 
-        Google Photos keeps stale activity nodes in its single-page DOM. Reusing that DOM
-        can apply one photo's likes to later photos. To prevent that, detection reloads the
-        current photo before opening activity and reloads it again afterward. Ambiguous
-        states fail closed and never trigger a download.
+        Google Photos is a single-page application and retains stale activity nodes.
+        Reloading the exact photo before and after detection isolates each decision. Pane
+        visibility is deliberately not inferred from brittle close-button selectors;
+        Google Photos uses different pane markup across accounts and screen sizes.
         """
         photo_url = page.url
         if f"/photo/{expected_photo_id}" not in photo_url:
@@ -138,29 +138,30 @@ class PhotoService:
         await self._reload_current_photo(page, photo_url, expected_photo_id)
         await self._show_viewer_controls(page)
 
-        # A visible Liked-by entry before opening activity proves the page is not in a
-        # clean state. Do not guess and do not download.
         liked_by = page.locator("[aria-label^='Liked by ']")
-        if await self._has_visible_match(liked_by):
+        preexisting = await self._visible_aria_labels(liked_by)
+        if preexisting:
             raise RuntimeError(
-                "Visible 'Liked by' activity existed before opening the activity pane; "
+                "Visible 'Liked by' evidence existed before View activity was opened; "
                 "refusing to classify this photo."
             )
 
-        opened = await self._open_activity_panel(page)
-        if not opened:
+        invoked = await self._invoke_view_activity(page)
+        if not invoked:
             raise RuntimeError(
-                "Could not open a fresh Google Photos activity pane for the current photo."
+                "Could not invoke the exact Google Photos 'View activity' action."
             )
 
         try:
-            await page.wait_for_timeout(800)
-            if not await self._activity_panel_is_open(page):
-                raise RuntimeError(
-                    "Activity pane did not remain visibly open; refusing to classify the photo."
-                )
+            # Activity content is loaded asynchronously. Sample repeatedly so a slow pane
+            # does not become a false negative, while never treating hidden nodes as likes.
+            visible_labels: list[str] = []
+            for _ in range(12):
+                visible_labels = await self._visible_aria_labels(liked_by)
+                if visible_labels:
+                    break
+                await page.wait_for_timeout(200)
 
-            visible_labels = await self._visible_aria_labels(liked_by)
             liked = bool(visible_labels)
             logger.info(
                 "Photo {} like evidence: count={}, labels={}",
@@ -171,9 +172,51 @@ class PhotoService:
             logger.info("Current photo liked by at least one participant: {}", liked)
             return liked
         finally:
-            # Reloading is slower than toggling the side pane, but it deterministically
-            # removes stale activity DOM and leaves the viewer ready for download/next.
             await self._reload_current_photo(page, photo_url, expected_photo_id)
+
+    async def _invoke_view_activity(self, page: Page) -> bool:
+        """Invoke only the exact read-only View activity action.
+
+        A successful invocation means the action itself was dispatched. We intentionally
+        do not require a particular close button or side-pane role because those selectors
+        vary in Google Photos. The subsequent decision uses only newly visible ``Liked by``
+        evidence on a freshly reloaded page.
+        """
+        candidates = page.locator("[aria-label='View activity']")
+        count = min(await candidates.count(), 20)
+
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    await candidate.click(timeout=5_000)
+                    await page.wait_for_timeout(500)
+                    logger.debug("Invoked visible View activity control at index {}.", index)
+                    return True
+            except Exception:
+                continue
+
+        # Some Google Photos layouts expose the functional toolbar button while
+        # Playwright reports it as hidden during an animation. Dispatching click on this
+        # exact aria-label is safe and cannot toggle a photo like.
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                clicked = await candidate.evaluate(
+                    """element => {
+                        if (!(element instanceof HTMLElement)) return false;
+                        element.click();
+                        return true;
+                    }"""
+                )
+                if clicked:
+                    await page.wait_for_timeout(500)
+                    logger.debug("Invoked DOM View activity control at index {}.", index)
+                    return True
+            except Exception:
+                continue
+
+        return False
 
     async def _reload_current_photo(
         self,
@@ -188,49 +231,6 @@ class PhotoService:
                 f"Photo changed while refreshing {expected_photo_id}; refusing to continue."
             )
 
-    async def _open_activity_panel(self, page: Page) -> bool:
-        candidates = page.locator("[aria-label='View activity']")
-        count = min(await candidates.count(), 20)
-
-        for index in range(count):
-            candidate = candidates.nth(index)
-            try:
-                if await candidate.is_visible() and await candidate.is_enabled():
-                    await candidate.click(timeout=5_000)
-                    if await self._wait_for_activity_panel(page):
-                        return True
-            except Exception:
-                continue
-
-        # Exact read-only fallback. Never evaluate-click any Like/Unlike control.
-        for index in range(count):
-            candidate = candidates.nth(index)
-            try:
-                await candidate.evaluate("element => element.click()")
-                if await self._wait_for_activity_panel(page):
-                    return True
-            except Exception:
-                continue
-
-        return False
-
-    async def _wait_for_activity_panel(self, page: Page) -> bool:
-        for _ in range(20):
-            if await self._activity_panel_is_open(page):
-                return True
-            await page.wait_for_timeout(150)
-        return False
-
-    async def _activity_panel_is_open(self, page: Page) -> bool:
-        selectors = (
-            "[aria-label='Close activity side pane']",
-            "[aria-label='Close activity panel']",
-        )
-        for selector in selectors:
-            if await self._has_visible_match(page.locator(selector)):
-                return True
-        return False
-
     async def _visible_aria_labels(self, locator: Locator) -> list[str]:
         labels: list[str] = []
         count = min(await locator.count(), 50)
@@ -244,17 +244,7 @@ class PhotoService:
                     labels.append(label)
             except Exception:
                 continue
-        return labels
-
-    async def _has_visible_match(self, locator: Locator) -> bool:
-        count = min(await locator.count(), 50)
-        for index in range(count):
-            try:
-                if await locator.nth(index).is_visible():
-                    return True
-            except Exception:
-                continue
-        return False
+        return sorted(set(labels))
 
     async def _show_viewer_controls(self, page: Page) -> None:
         viewport = page.viewport_size or {"width": 1440, "height": 1000}

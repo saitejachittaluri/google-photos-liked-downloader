@@ -8,7 +8,7 @@ from typing import Any
 from loguru import logger
 from playwright.async_api import Page
 
-from domain.activity_indexer import AlbumActivityIndexer
+from domain.robust_activity_indexer import RobustAlbumActivityIndexer
 from infrastructure.browser_manager import BrowserManager
 from infrastructure.database_manager import DatabaseManager
 from infrastructure.download_manager import DownloadManager
@@ -59,7 +59,7 @@ class PhotoService:
             await self.browser_manager.open_url(shared_album_url)
 
             # Complete the read-only activity index before any download is attempted.
-            self._liked_photo_ids = await AlbumActivityIndexer().index(page)
+            self._liked_photo_ids = await RobustAlbumActivityIndexer().index(page)
 
             await page.goto(shared_album_url, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(800)

@@ -6,7 +6,7 @@ import inspect
 from typing import Any
 
 from loguru import logger
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
 from infrastructure.browser_manager import BrowserManager
 from infrastructure.database_manager import DatabaseManager
@@ -18,8 +18,7 @@ class PhotoService:
     """Coordinate browser, navigation, detection, persistence, and downloads.
 
     The service deliberately never clicks a Like/Unlike control. A photo is treated as
-    liked only when its activity panel contains at least one accessibility element whose
-    label starts with ``Liked by ``.
+    liked only when its activity panel contains at least one participant-like entry.
     """
 
     def __init__(
@@ -84,7 +83,6 @@ class PhotoService:
                 if not photo_id:
                     raise RuntimeError("Could not determine the current photo ID.")
 
-                # A repeated ID means ArrowRight did not move or the album wrapped around.
                 if photo_id in seen_photo_ids:
                     logger.info("Album traversal completed at photo {}.", photo_id)
                     break
@@ -127,24 +125,96 @@ class PhotoService:
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
 
     async def _is_liked_by_anyone(self, page: Page) -> bool:
-        """Return True when the current photo activity contains at least one like.
+        """Return True when the current photo activity contains a participant like.
 
-        ``aria-label='Delete like'`` is intentionally not used because it can represent
-        only the signed-in user's own removable like. The activity panel is used to find
-        likes from any album participant.
+        The method selects only visible controls. Google Photos commonly keeps hidden
+        duplicate toolbar buttons in the DOM; clicking ``locator.first`` can therefore
+        time out even though a visible button exists elsewhere.
         """
-        activity_button = page.locator("[aria-label='View activity']")
-        if await activity_button.count() > 0:
-            try:
-                await activity_button.first.click(timeout=5_000)
-                await page.wait_for_timeout(500)
-            except Exception as exc:  # The panel may already be open.
-                logger.debug("Could not toggle the activity panel: {}", exc)
+        await self._show_viewer_controls(page)
 
-        liked_by = page.locator("[aria-label^='Liked by ']")
-        liked = await liked_by.count() > 0
-        logger.info("Current photo liked by at least one participant: {}", liked)
-        return liked
+        panel_open = await page.locator(
+            "[aria-label='Close activity side pane']:visible, "
+            "[aria-label='Close activity panel']:visible"
+        ).count() > 0
+
+        if not panel_open:
+            activity_button = await self._first_visible(
+                page.locator("button[aria-label='View activity']")
+            )
+            if activity_button is None:
+                activity_button = await self._first_visible(
+                    page.locator("[role='button'][aria-label='View activity']")
+                )
+            if activity_button is None:
+                raise RuntimeError(
+                    "Could not find a visible 'View activity' button for the current photo."
+                )
+
+            try:
+                await activity_button.click(timeout=5_000)
+                await page.wait_for_timeout(500)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not open the activity panel for the current photo."
+                ) from exc
+
+        try:
+            liked_selectors = (
+                "[aria-label^='Liked by ']",
+                "[aria-label*=' liked this photo']",
+                "[aria-label*=' liked a photo']",
+            )
+            liked = False
+            for selector in liked_selectors:
+                if await page.locator(selector).count() > 0:
+                    liked = True
+                    break
+
+            logger.info("Current photo liked by at least one participant: {}", liked)
+            return liked
+        finally:
+            await self._close_activity_panel(page)
+
+    async def _show_viewer_controls(self, page: Page) -> None:
+        """Reveal auto-hidden Google Photos viewer controls."""
+        viewport = page.viewport_size or {"width": 1440, "height": 1000}
+        await page.mouse.move(viewport["width"] // 2, 40)
+        await page.wait_for_timeout(250)
+
+    async def _first_visible(self, locator: Locator) -> Locator | None:
+        """Return the first visible and enabled match from a locator."""
+        count = min(await locator.count(), 20)
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    async def _close_activity_panel(self, page: Page) -> None:
+        close_candidates = (
+            page.locator("button[aria-label='Close activity side pane']"),
+            page.locator("[role='button'][aria-label='Close activity side pane']"),
+            page.locator("button[aria-label='Close activity panel']"),
+        )
+        for locator in close_candidates:
+            button = await self._first_visible(locator)
+            if button is not None:
+                try:
+                    await button.click(timeout=3_000)
+                    await page.wait_for_timeout(150)
+                    return
+                except Exception:
+                    break
+
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(150)
+        except Exception:
+            logger.debug("Unable to close the activity panel cleanly.")
 
     async def _seek_to_photo(self, target_photo_id: str) -> bool:
         """Navigate forward until ``target_photo_id`` is reached."""
@@ -163,7 +233,6 @@ class PhotoService:
                 return False
 
     async def _is_photo_downloaded(self, photo_id: str) -> bool:
-        """Support both the intended repository method and the current DB wrapper."""
         method = getattr(self.database_manager, "is_photo_downloaded", None)
         if callable(method):
             result = method(photo_id)
@@ -182,8 +251,6 @@ class PhotoService:
             )
             return bool(count)
         except Exception as exc:
-            # Database initialization is handled elsewhere; lack of a table should not
-            # cause a photo to be incorrectly considered downloaded.
             logger.debug("Could not check download history for {}: {}", photo_id, exc)
             return False
 
@@ -196,6 +263,5 @@ class PhotoService:
         return page
 
     def _inject_page(self, page: Page) -> None:
-        """Attach the launched page to collaborators created before browser startup."""
         self.navigation_engine.page = page
         self.download_manager.page = page

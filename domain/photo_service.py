@@ -17,9 +17,9 @@ from infrastructure.navigation_engine import NavigationEngine
 class PhotoService:
     """Coordinate browser, navigation, detection, persistence, and downloads.
 
-    The service deliberately never clicks a Like/Unlike control. A photo is treated as
-    liked only when its currently visible activity panel contains a visible participant-
-    like entry.
+    Safety rule: a photo is downloaded only when a freshly opened activity pane for the
+    current photo contains a visible accessibility label beginning with ``Liked by ``.
+    The service never clicks a Like, Unlike, or Delete-like control.
     """
 
     def __init__(
@@ -100,15 +100,17 @@ class PhotoService:
             await self.browser_manager.shutdown()
 
     async def _process_current_photo(self, page: Page, photo_id: str) -> None:
-        if await self._is_photo_downloaded(photo_id):
-            logger.info("Skipping previously downloaded photo {}.", photo_id)
-            return
-
-        liked = await self._is_liked_by_anyone(page)
+        # Re-evaluate the current UI even when the database says this photo was already
+        # downloaded. Earlier faulty classifications must not bypass the safety check.
+        liked = await self._is_liked_by_anyone(page, photo_id)
         await self.database_manager.add_photo(photo_id, page.url, liked)
 
         if not liked:
-            logger.info("Photo {} has no likes; skipping.", photo_id)
+            logger.info("Photo {} has no visible 'Liked by' activity; skipping.", photo_id)
+            return
+
+        if await self._is_photo_downloaded(photo_id):
+            logger.info("Photo {} is liked but was already downloaded; skipping.", photo_id)
             return
 
         if self.dry_run:
@@ -119,39 +121,72 @@ class PhotoService:
         await self.database_manager.add_download(photo_id, filename)
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
 
-    async def _is_liked_by_anyone(self, page: Page) -> bool:
-        """Return True only for a visible like entry in a freshly opened activity pane."""
-        await self._show_viewer_controls(page)
-        photo_url = page.url
+    async def _is_liked_by_anyone(self, page: Page, expected_photo_id: str) -> bool:
+        """Detect likes from an isolated, freshly loaded current-photo activity pane.
 
-        # Best-effort cleanup. Google Photos can retain stale accessibility nodes even
-        # after the pane has visually closed, so cleanup must not abort the whole run.
-        if await self._activity_panel_is_open(page):
-            await self._close_activity_panel(page, photo_url)
-            await page.wait_for_timeout(400)
+        Google Photos keeps stale activity nodes in its single-page DOM. Reusing that DOM
+        can apply one photo's likes to later photos. To prevent that, detection reloads the
+        current photo before opening activity and reloads it again afterward. Ambiguous
+        states fail closed and never trigger a download.
+        """
+        photo_url = page.url
+        if f"/photo/{expected_photo_id}" not in photo_url:
+            raise RuntimeError(
+                f"Current URL does not match expected photo {expected_photo_id}; refusing detection."
+            )
+
+        await self._reload_current_photo(page, photo_url, expected_photo_id)
+        await self._show_viewer_controls(page)
+
+        # A visible Liked-by entry before opening activity proves the page is not in a
+        # clean state. Do not guess and do not download.
+        liked_by = page.locator("[aria-label^='Liked by ']")
+        if await self._has_visible_match(liked_by):
+            raise RuntimeError(
+                "Visible 'Liked by' activity existed before opening the activity pane; "
+                "refusing to classify this photo."
+            )
 
         opened = await self._open_activity_panel(page)
         if not opened:
             raise RuntimeError(
-                "Could not open the Google Photos activity panel for the current photo."
+                "Could not open a fresh Google Photos activity pane for the current photo."
             )
 
         try:
-            await page.wait_for_timeout(700)
-            liked_selectors = (
-                "[aria-label^='Liked by ']",
-                "[aria-label*=' liked this photo']",
-                "[aria-label*=' liked a photo']",
-            )
-            for selector in liked_selectors:
-                if await self._has_visible_match(page.locator(selector)):
-                    logger.info("Current photo liked by at least one participant: True")
-                    return True
+            await page.wait_for_timeout(800)
+            if not await self._activity_panel_is_open(page):
+                raise RuntimeError(
+                    "Activity pane did not remain visibly open; refusing to classify the photo."
+                )
 
-            logger.info("Current photo liked by at least one participant: False")
-            return False
+            visible_labels = await self._visible_aria_labels(liked_by)
+            liked = bool(visible_labels)
+            logger.info(
+                "Photo {} like evidence: count={}, labels={}",
+                expected_photo_id,
+                len(visible_labels),
+                visible_labels,
+            )
+            logger.info("Current photo liked by at least one participant: {}", liked)
+            return liked
         finally:
-            await self._close_activity_panel(page, photo_url)
+            # Reloading is slower than toggling the side pane, but it deterministically
+            # removes stale activity DOM and leaves the viewer ready for download/next.
+            await self._reload_current_photo(page, photo_url, expected_photo_id)
+
+    async def _reload_current_photo(
+        self,
+        page: Page,
+        expected_url: str,
+        expected_photo_id: str,
+    ) -> None:
+        await page.reload(wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(900)
+        if page.url != expected_url or f"/photo/{expected_photo_id}" not in page.url:
+            raise RuntimeError(
+                f"Photo changed while refreshing {expected_photo_id}; refusing to continue."
+            )
 
     async def _open_activity_panel(self, page: Page) -> bool:
         candidates = page.locator("[aria-label='View activity']")
@@ -167,6 +202,7 @@ class PhotoService:
             except Exception:
                 continue
 
+        # Exact read-only fallback. Never evaluate-click any Like/Unlike control.
         for index in range(count):
             candidate = candidates.nth(index)
             try:
@@ -179,21 +215,36 @@ class PhotoService:
         return False
 
     async def _wait_for_activity_panel(self, page: Page) -> bool:
-        for _ in range(15):
+        for _ in range(20):
             if await self._activity_panel_is_open(page):
                 return True
             await page.wait_for_timeout(150)
         return False
 
     async def _activity_panel_is_open(self, page: Page) -> bool:
-        close_controls = (
+        selectors = (
             "[aria-label='Close activity side pane']",
             "[aria-label='Close activity panel']",
         )
-        for selector in close_controls:
+        for selector in selectors:
             if await self._has_visible_match(page.locator(selector)):
                 return True
         return False
+
+    async def _visible_aria_labels(self, locator: Locator) -> list[str]:
+        labels: list[str] = []
+        count = min(await locator.count(), 50)
+        for index in range(count):
+            item = locator.nth(index)
+            try:
+                if not await item.is_visible():
+                    continue
+                label = (await item.get_attribute("aria-label") or "").strip()
+                if label.startswith("Liked by "):
+                    labels.append(label)
+            except Exception:
+                continue
+        return labels
 
     async def _has_visible_match(self, locator: Locator) -> bool:
         count = min(await locator.count(), 50)
@@ -211,59 +262,6 @@ class PhotoService:
         await page.wait_for_timeout(100)
         await page.mouse.move(viewport["width"] // 2, 30)
         await page.wait_for_timeout(500)
-
-    async def _first_visible(self, locator: Locator) -> Locator | None:
-        count = min(await locator.count(), 20)
-        for index in range(count):
-            candidate = locator.nth(index)
-            try:
-                if await candidate.is_visible() and await candidate.is_enabled():
-                    return candidate
-            except Exception:
-                continue
-        return None
-
-    async def _close_activity_panel(self, page: Page, expected_photo_url: str) -> bool:
-        """Best-effort close of the activity pane without ever pressing Escape."""
-        close_candidates = (
-            page.locator("button[aria-label='Close activity side pane']"),
-            page.locator("[role='button'][aria-label='Close activity side pane']"),
-            page.locator("button[aria-label='Close activity panel']"),
-            page.locator("[role='button'][aria-label='Close activity panel']"),
-        )
-
-        for locator in close_candidates:
-            button = await self._first_visible(locator)
-            if button is None:
-                continue
-            try:
-                await button.click(timeout=3_000)
-                await page.wait_for_timeout(300)
-                if page.url == expected_photo_url:
-                    return True
-            except Exception:
-                continue
-
-        # The same View activity button toggles the pane in some layouts.
-        activity_controls = page.locator("[aria-label='View activity']")
-        count = min(await activity_controls.count(), 20)
-        for index in range(count):
-            try:
-                control = activity_controls.nth(index)
-                if await control.is_visible() and await control.is_enabled():
-                    await control.click(timeout=3_000)
-                else:
-                    await control.evaluate("element => element.click()")
-                await page.wait_for_timeout(300)
-                if page.url == expected_photo_url:
-                    return True
-            except Exception:
-                continue
-
-        logger.warning(
-            "Could not confirm activity-pane closure; continuing without using Escape."
-        )
-        return False
 
     async def _seek_to_photo(self, target_photo_id: str) -> bool:
         visited: set[str] = set()

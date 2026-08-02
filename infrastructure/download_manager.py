@@ -44,6 +44,7 @@ class DownloadManager:
         for attempt in range(1, self.max_retries + 1):
             try:
                 downloaded_path = await self._download_once()
+                await self._dismiss_open_menu()
                 logger.info("File downloaded successfully: {}", downloaded_path)
                 return str(downloaded_path)
             except Exception as exc:
@@ -65,6 +66,7 @@ class DownloadManager:
     async def _download_once(self) -> Path:
         """Handle both browser-download and direct-asset-navigation behaviours."""
         page = self._require_page()
+        viewer_url = page.url
         download_control = await self._open_download_action()
         loop = asyncio.get_running_loop()
         download_future: asyncio.Future[Download] = loop.create_future()
@@ -113,6 +115,7 @@ class DownloadManager:
                 await page.unroute("**/*", capture_asset_navigation)
             except Exception as exc:
                 logger.debug("Unable to remove temporary download route: {}", exc)
+            await self._restore_viewer(page, viewer_url)
 
     @staticmethod
     def _is_download_asset_request(request: Request) -> bool:
@@ -151,6 +154,7 @@ class DownloadManager:
         try:
             response = await page.context.request.get(
                 asset_url,
+                headers={"Referer": page.url},
                 timeout=self.download_timeout_ms,
             )
             if not response.ok:
@@ -321,6 +325,26 @@ class DownloadManager:
         raise DownloadError(
             "The Google Photos menu does not contain a usable Download action."
         )
+
+    async def _restore_viewer(self, page: Page, viewer_url: str) -> None:
+        """Return to the exact photo if Chromium began the intercepted navigation."""
+        if page.is_closed() or page.url == viewer_url:
+            return
+        logger.warning(
+            "Restoring Google Photos viewer after intercepted download navigation: {}",
+            viewer_url,
+        )
+        try:
+            await page.goto(
+                viewer_url,
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            await page.wait_for_timeout(500)
+        except Exception as exc:
+            raise DownloadError(
+                "The file was handled, but the Google Photos viewer could not be restored."
+            ) from exc
 
     async def _show_viewer_controls(self, page: Page) -> None:
         viewport = page.viewport_size or {"width": 1440, "height": 1000}

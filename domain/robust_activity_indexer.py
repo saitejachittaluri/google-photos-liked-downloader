@@ -19,6 +19,11 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
     indexer intentionally uses strict overflow semantics. This adapter keeps its structural
     activity-root checks, but also accepts a structurally related element whose scrollHeight
     exceeds its clientHeight even when Google marks it ``overflow: hidden``.
+
+    ``Liked by <person>`` is weak accessibility metadata that may be repeated on an avatar or
+    badge without containing the photo link. It is still used when it maps to a photo, but an
+    unmapped copy is not treated as a missing activity event. Strong activity text such as
+    ``<person> liked a photo`` must still map safely or the run fails closed.
     """
 
     _STRICT_SCROLLABLE = (
@@ -30,11 +35,52 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
         "&& !routeActivity) return false; "
         "return e.scrollHeight > e.clientHeight + 24;"
     )
-    if _STRICT_SCROLLABLE not in AlbumActivityIndexer.ACTIVITY_SCRIPT:
-        raise RuntimeError("AlbumActivityIndexer scroll predicate changed unexpectedly.")
-    ACTIVITY_SCRIPT = AlbumActivityIndexer.ACTIVITY_SCRIPT.replace(
+    _SIGNAL_COLLECTION_DECLARATION = (
+        "const ids = new Set(), unresolved = [], labels = [];"
+    )
+    _SAFE_SIGNAL_COLLECTION_DECLARATION = (
+        "const ids = new Set(), unresolved = [], weakUnmapped = [], labels = [];"
+    )
+    _UNMAPPED_SIGNAL_BLOCK = (
+        "if (mapped.length) mapped.forEach(id => ids.add(id));\n"
+        "    else unresolved.push(label || '<unlabelled like activity>');"
+    )
+    _SAFE_UNMAPPED_SIGNAL_BLOCK = (
+        "if (mapped.length) mapped.forEach(id => ids.add(id));\n"
+        "    else if (/^Liked by\\b/i.test(label)) weakUnmapped.push(label);\n"
+        "    else unresolved.push(label || '<unlabelled like activity>');"
+    )
+    _UNRESOLVED_RETURN = (
+        "unresolved:Array.from(new Set(unresolved)).slice(0, 50),\n"
+        "    signals:Array.from(new Set(labels)).slice(0, 30),"
+    )
+    _SAFE_UNRESOLVED_RETURN = (
+        "unresolved:Array.from(new Set(unresolved)).slice(0, 50),\n"
+        "    weakUnmapped:Array.from(new Set(weakUnmapped)).slice(0, 50),\n"
+        "    signals:Array.from(new Set(labels)).slice(0, 30),"
+    )
+
+    for expected in (
         _STRICT_SCROLLABLE,
-        _VIRTUAL_SCROLLABLE,
+        _SIGNAL_COLLECTION_DECLARATION,
+        _UNMAPPED_SIGNAL_BLOCK,
+        _UNRESOLVED_RETURN,
+    ):
+        if expected not in AlbumActivityIndexer.ACTIVITY_SCRIPT:
+            raise RuntimeError(
+                "AlbumActivityIndexer JavaScript changed unexpectedly; "
+                f"missing fragment: {expected!r}"
+            )
+
+    ACTIVITY_SCRIPT = (
+        AlbumActivityIndexer.ACTIVITY_SCRIPT
+        .replace(_STRICT_SCROLLABLE, _VIRTUAL_SCROLLABLE)
+        .replace(
+            _SIGNAL_COLLECTION_DECLARATION,
+            _SAFE_SIGNAL_COLLECTION_DECLARATION,
+        )
+        .replace(_UNMAPPED_SIGNAL_BLOCK, _SAFE_UNMAPPED_SIGNAL_BLOCK)
+        .replace(_UNRESOLVED_RETURN, _SAFE_UNRESOLVED_RETURN)
     )
 
     async def index(self, page: Page) -> set[str]:
@@ -50,11 +96,17 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
 
         liked: set[str] = set()
         unresolved: set[str] = set()
+        weak_unmapped: set[str] = set()
 
         def absorb(state: dict[str, Any]) -> bool:
             before = len(liked)
             liked.update(str(value) for value in state.get("ids", []))
-            unresolved.update(str(value) for value in state.get("unresolved", []))
+            unresolved.update(
+                str(value) for value in state.get("unresolved", [])
+            )
+            weak_unmapped.update(
+                str(value) for value in state.get("weakUnmapped", [])
+            )
             return len(liked) != before
 
         first = await self._wait_for_activity_content(page, absorb)
@@ -64,7 +116,7 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
 
         if unresolved:
             raise RuntimeError(
-                "Like activity could not be mapped safely to every photo. "
+                "Strong like activity could not be mapped safely to every photo. "
                 "No downloads were attempted. Examples: "
                 f"{sorted(unresolved)[:10]}"
             )
@@ -77,6 +129,13 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
         if invalid:
             raise RuntimeError(
                 f"Activity indexing returned invalid photo IDs: {invalid[:5]}"
+            )
+
+        if weak_unmapped:
+            logger.info(
+                "Ignored {} unmapped duplicate 'Liked by' accessibility labels; "
+                "all strong like events were mapped.",
+                len(weak_unmapped),
             )
 
         logger.info(
@@ -108,7 +167,6 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
             if state.get("scrollerFound"):
                 if self._safe_scroller(page, state):
                     return state
-                # A full-page album grid is not an acceptable activity scroller.
                 state["scrollerFound"] = False
 
             if sample == 1 or sample % 10 == 0:
@@ -135,13 +193,13 @@ class RobustAlbumActivityIndexer(AlbumActivityIndexer):
         tag = str(descriptor.get("tag") or "").lower()
         source = str(descriptor.get("source") or "")
         width = int(descriptor.get("width") or 0)
-        viewport_width = int((page.viewport_size or {"width": 1440})["width"])
+        viewport_width = int(
+            (page.viewport_size or {"width": 1440})["width"]
+        )
 
-        # A document scroller is valid only when Google navigates to an Activity route.
         if source == "activity-route-document":
             return True
 
-        # Reject body/html chosen merely because the album behind the panel is very tall.
         if tag in {"body", "html"} and width >= int(viewport_width * 0.80):
             return False
 

@@ -12,6 +12,7 @@ from domain.robust_activity_indexer import RobustAlbumActivityIndexer
 from infrastructure.browser_manager import BrowserManager
 from infrastructure.database_manager import DatabaseManager
 from infrastructure.download_manager import DownloadManager
+from infrastructure.exceptions import DownloadError
 from infrastructure.navigation_engine import NavigationEngine
 
 
@@ -41,6 +42,7 @@ class PhotoService:
             "not_liked": 0,
             "downloaded": 0,
             "already_downloaded": 0,
+            "download_failed": 0,
         }
 
     async def process_photos(self, shared_album_url: str) -> None:
@@ -96,10 +98,14 @@ class PhotoService:
             await self.browser_manager.shutdown()
             logger.info(
                 "Run summary: indexed_liked={}, inspected={}, liked={}, not_liked={}, "
-                "downloaded={}, already_downloaded={}.",
-                len(self._liked_photo_ids), self._summary["inspected"],
-                self._summary["liked"], self._summary["not_liked"],
-                self._summary["downloaded"], self._summary["already_downloaded"],
+                "downloaded={}, already_downloaded={}, download_failed={}.",
+                len(self._liked_photo_ids),
+                self._summary["inspected"],
+                self._summary["liked"],
+                self._summary["not_liked"],
+                self._summary["downloaded"],
+                self._summary["already_downloaded"],
+                self._summary["download_failed"],
             )
 
     async def _process_current_photo(self, page: Page, photo_id: str) -> None:
@@ -122,8 +128,26 @@ class PhotoService:
 
         current_id = await self.navigation_engine.current_photo_id()
         if current_id != photo_id:
-            raise RuntimeError(f"Viewer changed from {photo_id} to {current_id}; download refused.")
-        filename = await self.download_manager.download_file()
+            self._summary["download_failed"] += 1
+            logger.error(
+                "Viewer changed from {} to {}; download refused and traversal will continue.",
+                photo_id,
+                current_id,
+            )
+            return
+
+        try:
+            filename = await self.download_manager.download_file()
+        except DownloadError as exc:
+            self._summary["download_failed"] += 1
+            logger.error(
+                "Download failed for liked photo {}; traversal will continue and a later "
+                "run can retry it: {}",
+                photo_id,
+                exc,
+            )
+            return
+
         await self.database_manager.add_download(photo_id, filename)
         self._summary["downloaded"] += 1
         logger.info("Downloaded liked photo {} to {}.", photo_id, filename)
